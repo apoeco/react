@@ -104,6 +104,8 @@ import {inferMutationAliasingEffects} from '../Inference/InferMutationAliasingEf
 import {inferMutationAliasingRanges} from '../Inference/InferMutationAliasingRanges';
 import {validateNoDerivedComputationsInEffects} from '../Validation/ValidateNoDerivedComputationsInEffects';
 import {nameAnonymousFunctions} from '../Transform/NameAnonymousFunctions';
+import {Result} from '../Utils/Result';
+import {CompilerError} from '../CompilerError';
 
 export type CompilerPipelineValue =
   | {kind: 'ast'; name: string; value: CodegenFunction}
@@ -144,6 +146,24 @@ function run(
   return runWithEnvironment(func, env);
 }
 
+function validateFactory(env: Environment) {
+  const errors: Array<Result<unknown, CompilerError>> = [];
+
+  function validate<T, E extends CompilerError>(result: Result<T, E>) {
+    if (result.isOk()) {
+      return result.unwrap();
+    }
+
+    if (env.programContext.opts.panicThreshold === 'none') {
+      errors.push(result);
+      return null;
+    }
+
+    return result.unwrap();
+  }
+
+  return {validate, errors};
+}
 /*
  * Note: this is split from run() to make `config` out of scope, so that all
  * access to feature flags has to be through the Environment for consistency.
@@ -157,6 +177,7 @@ function runWithEnvironment(
   const log = (value: CompilerPipelineValue): void => {
     env.logger?.debugLogIRs?.(value);
   };
+  const {validate, errors} = validateFactory(env);
   const hir = lower(func, env).unwrap();
   log({kind: 'hir', name: 'HIR', value: hir});
 
@@ -164,7 +185,7 @@ function runWithEnvironment(
   log({kind: 'hir', name: 'PruneMaybeThrows', value: hir});
 
   validateContextVariableLValues(hir);
-  validateUseMemo(hir).unwrap();
+  validate(validateUseMemo(hir));
 
   if (
     env.isInferredMemoEnabled &&
@@ -172,7 +193,7 @@ function runWithEnvironment(
     !env.config.disableMemoizationForDebugging &&
     !env.config.enableChangeDetectionForDebugging
   ) {
-    dropManualMemoization(hir).unwrap();
+    validate(dropManualMemoization(hir));
     log({kind: 'hir', name: 'DropManualMemoization', value: hir});
   }
 
@@ -205,10 +226,10 @@ function runWithEnvironment(
 
   if (env.isInferredMemoEnabled) {
     if (env.config.validateHooksUsage) {
-      validateHooksUsage(hir).unwrap();
+      validate(validateHooksUsage(hir));
     }
     if (env.config.validateNoCapitalizedCalls) {
-      validateNoCapitalizedCalls(hir).unwrap();
+      validate(validateNoCapitalizedCalls(hir));
     }
   }
 
@@ -231,7 +252,7 @@ function runWithEnvironment(
   log({kind: 'hir', name: 'InferMutationAliasingEffects', value: hir});
   if (env.isInferredMemoEnabled) {
     if (mutabilityAliasingErrors.isErr()) {
-      throw mutabilityAliasingErrors.unwrapErr();
+      errors.push(mutabilityAliasingErrors);
     }
   }
 
@@ -253,7 +274,7 @@ function runWithEnvironment(
   log({kind: 'hir', name: 'InferMutationAliasingRanges', value: hir});
   if (env.isInferredMemoEnabled) {
     if (mutabilityAliasingRangeErrors.isErr()) {
-      throw mutabilityAliasingRangeErrors.unwrapErr();
+      errors.push(mutabilityAliasingRangeErrors);
     }
     validateLocalsNotReassignedAfterRender(hir);
   }
@@ -264,11 +285,11 @@ function runWithEnvironment(
     }
 
     if (env.config.validateRefAccessDuringRender) {
-      validateNoRefAccessInRender(hir).unwrap();
+      validate(validateNoRefAccessInRender(hir));
     }
 
     if (env.config.validateNoSetStateInRender) {
-      validateNoSetStateInRender(hir).unwrap();
+      validate(validateNoSetStateInRender(hir));
     }
 
     if (env.config.validateNoDerivedComputationsInEffects) {
@@ -284,10 +305,19 @@ function runWithEnvironment(
     }
 
     if (env.config.validateNoImpureFunctionsInRender) {
-      validateNoImpureFunctionsInRender(hir).unwrap();
+      validate(validateNoImpureFunctionsInRender(hir));
     }
 
-    validateNoFreezingKnownMutableFunctions(hir).unwrap();
+    validate(validateNoFreezingKnownMutableFunctions(hir));
+  }
+
+  if (errors.length > 0) {
+    for (const error of errors) {
+      if (error.isErr()) {
+        env.logErrors(error);
+      }
+    }
+    throw errors[0];
   }
 
   inferReactivePlaces(hir);
